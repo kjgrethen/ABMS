@@ -47,9 +47,7 @@ for (country in countries) {
     
     unzip(z, exdir = unzip_dir)
     
-    # Path to the Data folder inside the unzipped content
-    data_path <- file.path(unzip_dir, "Data")
-    csv_files <- list.files(data_path, pattern = "\\.csv$", full.names = TRUE)
+    csv_files <- list.files(unzip_dir, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE)
     
     if (length(csv_files) == 0) {
       unlink(unzip_dir, recursive = TRUE)

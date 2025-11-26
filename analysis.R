@@ -1,16 +1,18 @@
-set.seed(42)
 
 #clear workspace
 rm(list = ls())
+
+set.seed(42)
 
 library("data.table")
 library("stringr")
 library("ggplot2")
 library("ggrepel")
+library("lubridate")
+library("RColorBrewer")
 
-
-#filepath = file.path("D:", "ABMS", "country_outputs")
-filepath = file.path("C:/Users/au784040/Documents_C/ABMS_Biodiversa/country_outputs")
+filepath = file.path("D:", "ABMS", "country_outputs")
+#filepath = file.path("C:/Users/au784040/Documents_C/ABMS_Biodiversa/country_outputs")
 
 # List all csv files
 country_files <- list.files(filepath, pattern = "\\.csv$", full.names = T)
@@ -33,13 +35,14 @@ overview = data.table(country = countries,
                       list_species = vector("list", n),
                       n_species_valid = numeric(n),
                       list_species_valid = vector("list", n),
-                      tot_bat_activity = numeric(n))
+                      tot_bat_activity = numeric(n)
+                      )
 i = 0
 
 for (c in country_files){
   i = i+1
   
-  message("Processing ", i, "/", length(country_files), ": ", basenmae(country_files[i]))
+  message("Processing ", i, "/", length(country_files), ": ", basename(country_files[i]))
 
   file = fread(c)
   overview[i, n_detect := file[,.N]]
@@ -47,62 +50,138 @@ for (c in country_files){
   overview[i, list_species := unique(file$class)]
   #hist(file$det_prob)
   
-  #TODO extract dates
-  #file[, date := as.IDate(sub(".*_(\\d{8})_.*", "\\1", source_file), format = "%Y%m%d")]
+  overview[i,n_files := file[, length(unique(source_file))]]
   
-  file[, group := cumsum(id == 0)]
-  overview[i,n_files := file[, max(group)]]
  
   #filter for valid detections
-  file = file[det_prob > 0.495, ]
-  overview[i, n_detect_valid := file[,.N]]
+  file[det_prob <= 0.495, class := "empty"]
+  overview[i, n_detect_valid := file[class != "empty",.N]]
   
   #filter for at least 2 valid detections per file
-  file[, val := .N >= 2, by = group]
-  file = file[val == TRUE,]
-  overview[i, n_files_valid := file[, length(unique(group))]]
+  file[class != "empty", val := .N >= 2, by = source_file]
+  file[val != TRUE,class := "empty"]
+  overview[i, n_files_valid := file[class != "empty", length(unique(source_file))]]
   
   #filter out most likely species per file
   species = file[, .(class_prob_sum = sum(class_prob),
                      class_prob_mean = mean(class_prob),
                      n_calls = .N),
-                 by = .(group, class)]
+                 by = .(source_file, class)]
   
   #keep only species with highest summed class probability
-  species = species[species[, .I[class_prob_sum == max(class_prob_sum)], by = group]$V1]
-  file = file[species[,.(group, class)], on = .(group, class), nomatch = 0]
+  species = species[species[, .I[class_prob_sum == max(class_prob_sum)], by = source_file]$V1]
+  file = file[species[,.(source_file, class)], on = .(source_file, class), nomatch = 0]
   
   overview[i, n_species_valid := length(unique(file$class))]
   overview[i, list_species_valid := unique(file$class)]
   
-  #compute duration
-  file[, dur := end_time - start_time]
-  overview[i, tot_bat_activity := sum(file$dur)]
-  
-  files[[basename(c)]] = file[, .(duration = sum(dur)), by = .(group, class, country)]
+  #OLD:compute duration
+  #file[, dur := end_time - start_time]
+  #overview[i, tot_bat_activity := sum(file$dur)]
+
+  files[[basename(c)]] = file[, unique(file[, .(source_zip, source_file, country, class)])]
   
 }
 
 data <- rbindlist(files, use.names = TRUE, fill = TRUE)
 
-data[, country := factor(country,  levels= c("belgium", "bulgaria", "croatia", "czech", "denmark", "finland",
-                                             "ireland", "italy", "netherlands", "slovakia", "spain",       
-                                             "sweden"),  
-                         labels = c("Belgium", "Bulgaria", "Croatia", "Czech Republic", "Denmark", "Finland",
-                                    "Ireland", "Italy", "The Netherlands", "Slovakia", "Spain",       
-                                    "Sweden"))]
+data[, habitat_code := sub(".*_([A-Z]\\d+)_.*", "\\1", source_zip)]
+data[, habitat := substr(habitat_code, 1, 1)]
 
+data[, country := factor(country,  levels= c("finland", "sweden", "denmark", "ireland", "netherlands", 
+                                             "belgium", "czech", "slovakia", "croatia", "bulgaria", "italy", "spain"),  
+                         labels = c("Finland", "Sweden", "Denmark", "Ireland", "Netherlands", 
+                                    "Belgium", "Czechia", "Slovakia", "Croatia", "Bulgaria", "Bolzano", "Spain"))]
+data[, class := factor(class, levels = sort(unique(class)))]
 data[, genus := tstrsplit(class, " ")[[1]]]
+#combine ENV complex
 data[genus == "Eptesicus" | genus == "Nyctalus", genus := "ENV"]
+#keep Pnat separate
+data[class == "Pipistrellus nathusii", genus := class]
+data[genus == "Pipistrellus", genus := "Pipistrellus pip./pyg."]
+data[, genus := factor(genus, levels = sort(unique(genus)))]
 
+data[, date := as.IDate(sub(".*_(\\d{8})_.*", "\\1", source_file), format = "%Y%m%d", tz = "UTC")]
+data[, time := as.ITime(sub(".*_(\\d{6})\\..*", "\\1", source_file), format = "%H%M%S", tz = "UTC")]
+data[, timestamp := ymd_hms(paste(as.character(date), as.character(time)), tz = "UTC")]
+data[, night := as.IDate(ifelse(time >= as.ITime("12:01:00"), date, date-1))]
+data[, julian_day := yday(night)+1]
+
+#TODO: there were some that didn't parse...
+data = data[!is.na(timestamp),]
+
+
+fwrite(data, "overall_data.csv", sep = ",")
+
+rm(species, files, file)
 
 ## data plots ####
 
-### percent total activity ####
+### N files with detections per species ####
+
+#TODO: careful may need to be averaged across the two loactions instead of just n files
+agg <- data[, .(n_files = .N), by = .(country, habitat, genus)]
+agg[, percent := n_files/sum(n_files), by = .(country, habitat)]
+
+agg[, country := factor(country, levels = rev(levels(country)))]
+agg[, habitat := factor(habitat, levels = c("F", "G", "W"), 
+                        labels = c("Forest", "Grassland", "Wetland"))]
+
+colors <- brewer.pal(n = 12, name = "Paired")  # 12 colors available in Paired
+
+# Horizontal stacked bar chart faceted by habitat
+ggplot(agg, aes(x = percent, y = country, fill = genus)) +
+  geom_col() +
+  facet_wrap(~habitat) +
+  scale_fill_manual(values = c(
+    "Barbastellus" = colors[12],
+    "ENV" = colors[7],
+    "Myotis" = colors[5],
+    "Pipistrellus pip./pyg." = colors[4], 
+    "Pipistrellus nathusii" = colors[3], 
+    "Plecotus" = colors[2],
+    "Rhinolophus" = colors[6]
+  )) +
+  labs(title = NULL, 
+       x = "% Detections", 
+       y = NULL,
+       fill = NULL)+
+  theme_bw(base_size = 16)+
+  theme(
+    strip.background = element_rect(fill = "white", color = "black"),  # removes the grey background
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1)  # rotate 45 degrees
+  )
+
+### N files with detections per day ####
+agg <- data[, .(n_files = .N), by = .(country, habitat_code, habitat, julian_day, night)]
+
+ggplot(agg, aes(x = night, y = habitat_code)) +
+  geom_point() +
+  facet_grid(rows = vars(country)) +
+  labs(title = NULL, 
+       x = "Date", 
+       y = "Partner and location")+
+  theme_bw(base_size = 16)+
+  theme(
+    #strip.background = element_rect(fill = "white", color = "black"),  # removes the grey background
+  )
+
+
+agg <- data[, .(n_files = .N), by = .(country, habitat, julian_day, night)]
+agg[, habitat := factor(habitat, levels = c("F", "G", "W"), 
+                        labels = c("Forest", "Grassland", "Wetland"))]
+
+range_dat = agg[, .(min_day = min(night),
+                    max_day = max(night)), by = country]
+
+hist(agg[, n_files])
+
+
+### OLD - percent total activity ####
 
 agg <- data[, .(tot_duration = sum(duration)), by = .(class)]
 agg[, percent := tot_duration / sum(tot_duration) * 100]
-agg[, class := factor(class, levels = sort(class))]
+
 agg= agg[order(class),]
 
 # Compute cumulative sum of percent in stacking order (factor levels)
