@@ -10,9 +10,13 @@ library("ggplot2")
 library("ggrepel")
 library("lubridate")
 library("RColorBrewer")
+library(mgcv)
+library(tidyverse)
+library(gratia) #model diagnostics
+library(DHARMa) #model diagnostics
 
-filepath = file.path("D:", "ABMS", "country_outputs")
-#filepath = file.path("C:/Users/au784040/Documents_C/ABMS_Biodiversa/country_outputs")
+#filepath = file.path("D:", "ABMS", "country_outputs")
+filepath = file.path("C:/Users/au784040/Documents_C/ABMS_Biodiversa/country_outputs")
 
 # List all csv files
 country_files <- list.files(filepath, pattern = "\\.csv$", full.names = T)
@@ -104,12 +108,10 @@ data[, genus := factor(genus, levels = sort(unique(genus)))]
 data[, date := as.IDate(sub(".*_(\\d{8})_.*", "\\1", source_file), format = "%Y%m%d", tz = "UTC")]
 data[, time := as.ITime(sub(".*_(\\d{6})\\..*", "\\1", source_file), format = "%H%M%S", tz = "UTC")]
 data[, timestamp := ymd_hms(paste(as.character(date), as.character(time)), tz = "UTC")]
+#some corrupted file names need to be removed
+data = data[!is.na(timestamp),]
 data[, night := as.IDate(ifelse(time >= as.ITime("12:01:00"), date, date-1))]
 data[, julian_day := yday(night)+1]
-
-#TODO: there were some that didn't parse...
-data = data[!is.na(timestamp),]
-
 
 fwrite(data, "overall_data.csv", sep = ",")
 
@@ -117,10 +119,13 @@ rm(species, files, file)
 
 ## data plots ####
 
-### N files with detections per species ####
+### species distribution ####
+
+#based on N detections per species
 
 #TODO: careful may need to be averaged across the two loactions instead of just n files
 agg <- data[, .(n_files = .N), by = .(country, habitat, genus)]
+agg = agg[genus != "empty",]
 agg[, percent := n_files/sum(n_files), by = .(country, habitat)]
 
 agg[, country := factor(country, levels = rev(levels(country)))]
@@ -152,29 +157,256 @@ ggplot(agg, aes(x = percent, y = country, fill = genus)) +
     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1)  # rotate 45 degrees
   )
 
-### N files with detections per day ####
-agg <- data[, .(n_files = .N), by = .(country, habitat_code, habitat, julian_day, night)]
+### available data ####
 
-ggplot(agg, aes(x = night, y = habitat_code)) +
+# N files with detections per day
+agg <- data[, .(n_files = .N, 
+                 no_bats = sum(genus == "empty"),
+                 bats = sum(genus != "empty")), by = .(country, habitat_code, habitat, julian_day, night)]
+
+agg[, country_label := factor(country,  levels= c("Belgium","Bulgaria","Czechia", "Denmark", "Spain",
+                                                  "Finland", "Croatia", "Ireland", "Bolzano", "Netherlands",
+                                                  "Sweden", "Slovakia"),  
+                         labels = c("BE", "BG", "CZ", "DK", "ES", 
+                                    "FI", "HR", "IE", "IT", "NL", "SE", "SK"))]
+
+
+ggplot(agg, aes(x = julian_day, y = habitat_code)) +
   geom_point() +
-  facet_grid(rows = vars(country)) +
+  #facet_grid(rows = vars(country_label)) +
+  facet_wrap(
+    ~ country_label,
+    nrow = 6,         # six rows
+    ncol = 2,         # two columns
+    strip.position = "right"
+  )+
+  scale_x_continuous(
+    limits = c(75,300),
+    breaks = c(100, 150, 200, 250, 300)   # keep only these gridlines
+  ) +
   labs(title = NULL, 
-       x = "Date", 
-       y = "Partner and location")+
-  theme_bw(base_size = 16)+
+       x = "Day of the Year", 
+       y = "Location code")+
+  theme_bw(base_size = 14)+
   theme(
-    #strip.background = element_rect(fill = "white", color = "black"),  # removes the grey background
+      strip.placement = "outside",  # ensures strips appear on the outer right
+      #strip.background = element_rect(fill = "white")
+      panel.grid.major.y = element_blank(), # remove all major y gridlines
+      panel.grid.minor.y = element_blank(), # remove minor y gridlines
+      panel.grid.major.x = element_line(),  # keep default x gridlines
+      panel.grid.minor.x = element_blank()  # optional: remove minor x gridlines
+    )
+
+### across days ##########
+
+agg[, siteID := interaction(country, habitat_code, sep = "_")]
+
+hist(agg$bats)
+mean(agg$bats)
+var(agg$bats)
+# var > Mean -> (overdispersal) neg binom: make sure model is not zero-inflated
+
+formula <- bats ~ 
+  
+  #interaction of habitat and country
+  habitat*country +
+  
+  #time variable 
+  s(julian_day, by = interaction(habitat, country), bs = "cc", k = 50) +
+  
+  #random effect of deployment within habitat
+  s(siteID, bs = "re")
+  
+  
+#full model
+gam_nb <- bam(formula,
+               family = nb(), 
+               data = agg, 
+               method = "fREML",
+               discrete = T, # Uses a fast approximation method (good for large data)
+               control = gam.control(trace = T), #for console output
+               select = TRUE, # to shrink terms that aren't helping to zero
+               knots = list(julian_day = c(1, 366))
+)
+
+#appraisal:
+sim_res = simulateResiduals(gam_nb)
+plot(sim_res)
+testDispersion(sim_res) #neglectably small disp. value < 1
+testZeroInflation(sim_res) #problem -> clear zero-inflation
+
+appraise(
+  gam_nb, 
+  point_alpha = 0.25,
+  method = "simulate",
+  type = 'deviance'
+)
+
+agg %>% 
+  as_tibble %>% 
+  mutate(
+    pred = predict(gam_nb, ., type = "response") %>% 
+      as.vector()
+  ) |> 
+  ggplot(aes(pred, bats)) +
+  geom_bin2d(binwidth = 0.1) +
+  stat_summary_bin(fun.data = mean_se) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  scale_fill_viridis_c(trans = "log10")
+
+#model inspection
+summary(gam_nb)
+
+#If the diagnostic "k' index" is near 1 or p-value < 0.05, your k may be too small.
+#If the effective degrees of freedom (edf) is close to k-1, consider increasing k.
+k.check(gam_nb)
+
+#### binomial model instead ####
+agg[, bats_present := as.numeric(I(bats > 0))]
+
+hist(as.numeric(agg$bats_present))
+mean(agg$bats_present)
+var(agg$bats_present)
+# var < Mean 
+
+formula <- bats_present ~ 
+  
+  #interaction of habitat and country
+  habitat*country +
+  
+  #time variable 
+  s(julian_day, by = interaction(habitat, country), bs = "cc", k = 20) +
+  
+  #random effect of deployment within habitat
+  s(siteID, bs = "re")
+
+
+#full model
+gam_bin <- bam(formula,
+              family = binomial, 
+              data = agg, 
+              method = "fREML",
+              discrete = T, # Uses a fast approximation method (good for large data)
+              control = gam.control(trace = T), #for console output
+              select = TRUE, # to shrink terms that aren't helping to zero
+              knots = list(julian_day = c(1, 366))
+)
+
+#appraisal:
+sim_res = simulateResiduals(gam_bin)
+plot(sim_res)
+testDispersion(sim_res) #neglectably small disp. value < 1
+testZeroInflation(sim_res) #problem -> clear zero-inflation
+
+appraise(
+  gam_bin, 
+  point_alpha = 0.25,
+  method = "simulate",
+  type = 'deviance'
+)
+
+agg %>% 
+  as_tibble %>% 
+  mutate(
+    pred = predict(gam_nb, ., type = "response") %>% 
+      as.vector()
+  ) |> 
+  ggplot(aes(pred, bats_present)) +
+  geom_bin2d(binwidth = 0.1) +
+  stat_summary_bin(fun.data = mean_se) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick") +
+  scale_fill_viridis_c(trans = "log10")
+
+#model inspection
+summary(gam_bin)
+
+#If the diagnostic "k' index" is near 1 or p-value < 0.05, your k may be too small.
+#If the effective degrees of freedom (edf) is close to k-1, consider increasing k.
+k.check(gam_bin)
+
+###### plots ####
+
+#plotting partial effects (effects of one predictor without influence of the others)
+draw(gam_nb)
+
+s_gam = smooth_estimates(gam_nb)
+s_gam |>
+  add_confint() |>
+  # Split the interaction column into habitat and country
+  separate(`interaction(habitat, country)`, 
+           into = c("habitat", "country"), sep = "\\.") |>
+  ggplot(aes(y = .estimate, x = julian_day)) +
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci),
+              alpha = 0.2, fill = "forestgreen"
+  ) +
+  geom_line(colour = "forestgreen", linewidth = 1.5) +
+  facet_grid(country ~ habitat, scales = "free")+
+  labs(
+    y = "Partial effect",
+    x = "Days of the year"
+  )
+
+All_days = ggplot(fv_trimmed, aes(x = julian_day, y = .fitted)) +
+  # ADD VERTICAL DASHED LINES:
+  geom_vline(
+    xintercept = c(135.5, 227.5),  
+    linetype = "dashed",
+    color = "grey",
+    size = 0.5
+  )+
+  geom_ribbon(aes(ymin = .lower_ci, ymax = .upper_ci), alpha = 0.2) +
+  geom_line(size = 0.7) +
+  scale_y_continuous(
+    breaks = c(0, 0.5, 1),
+    limits = c(-0.1, 1.1)
+  ) +
+  facet_grid(area ~.)+
+  stat_bin2d( # default bins = 30 
+    data = dat_model,
+    aes(x = julian_day, y = plot_bins, fill = after_stat(count)),
+    #bins = dat_model[, length(unique(julian_day))]/5, 
+    binwidth = c(5,0.05),
+    drop = TRUE, 
+    alpha = 0.6,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_viridis_c(name = "Number of\nobservations", 
+                       trans = "log10",
+                       #breaks = c(1, 10, 100, 500),
+                       option = "viridis",
+                       oob = scales::squish) +
+  labs(y = "Modelled probability of bat activity", x = "Julian calendar day")+
+  theme_bw(base_size = 16) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
   )
 
 
-agg <- data[, .(n_files = .N), by = .(country, habitat, julian_day, night)]
+ggsave(
+  filename = "plots/All_days.png",   
+  plot = All_days,             
+  #device = cairo_pdf,          # high-quality PDF rendering
+  width = 20,                  
+  height = 30,
+  unit = "cm",
+  dpi = 300                    
+)
+
+
+
+
+###
+agg <- data[, .(n_files = .N, 
+                no_bats = sum(genus == "empty"),
+                bats = sum(genus != "empty")), by = .(country, habitat, julian_day, night)]
 agg[, habitat := factor(habitat, levels = c("F", "G", "W"), 
                         labels = c("Forest", "Grassland", "Wetland"))]
 
 range_dat = agg[, .(min_day = min(night),
                     max_day = max(night)), by = country]
 
-hist(agg[, n_files])
+hist(agg[, bats])
 
 
 ### OLD - percent total activity ####
@@ -205,7 +437,7 @@ ggsave("tot_act.png",tot_act, width = 20, height = 17, dpi = 300, units = "cm", 
 
 fwrite(agg, "species_activity_aggr.csv", sep = ",")
 
-### by country ####
+#### by country ####
 
 agg <- data[, .(tot_duration = sum(duration)), by = .(genus, country)]
 agg[, percent := tot_duration / sum(tot_duration) * 100, by = country]
@@ -240,7 +472,7 @@ ggsave("tot_act_by_country.png",tot_act_country, width = 30, height = 27, dpi = 
 
 fwrite(agg, "species_activity_by_country_aggr.csv", sep = ",")
 
-### validation effort ####
+#### validation effort ####
 
 overview[, percent_files_valid := n_files_valid/n_files *100]
 overview[, country := factor(country, levels = country[order(-n_files)])]
