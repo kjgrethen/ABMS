@@ -4,12 +4,12 @@ rm(list = ls())
 
 set.seed(42)
 
-library("data.table")
-library("stringr")
-library("ggplot2")
-library("ggrepel")
-library("lubridate")
-library("RColorBrewer")
+library(data.table)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(lubridate)
+library(RColorBrewer)
 library(mgcv)
 library(tidyverse)
 library(gratia) #model diagnostics
@@ -80,8 +80,8 @@ for (c in country_files){
   overview[i, list_species_valid := unique(file$class)]
   
   #OLD:compute duration
-  #file[, dur := end_time - start_time]
-  #overview[i, tot_bat_activity := sum(file$dur)]
+  file[, duration := end_time - start_time]
+  overview[i, tot_bat_activity := sum(file$duration)]
 
   files[[basename(c)]] = file[, unique(file[, .(source_zip, source_file, country, class)])]
   
